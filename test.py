@@ -6,13 +6,13 @@ load_dotenv(override=True)
 
 from airllm import AutoModel
 
-MODEL_CACHE_PATH = os.getenv("MODEL_CACHE_PATH", ".cache")
+MODEL_CACHE_PATH = os.path.join(os.getenv("MODEL_CACHE_PATH", ".cache"), "Qwen2.5-Coder-7B")
 HF_TOKEN = os.getenv("HF_TOKEN") or None
 
 MAX_LENGTH = 128
 # could use hugging face model repo id:
 model = AutoModel.from_pretrained(
-    "garage-bAInd/Platypus2-70B-instruct",
+    "Qwen/Qwen2.5-Coder-7B",
     layer_shards_saving_path=MODEL_CACHE_PATH,
     hf_token=HF_TOKEN
 )

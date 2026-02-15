@@ -52,6 +52,8 @@ except ImportError:
 
 class AirLLMBaseModel(GenerationMixin):
 
+    _is_stateful = False
+
     # customize layer names here
     def set_layer_names_dict(self):
         self.layer_names_dict = {'embed': 'model.embed_tokens',
@@ -244,6 +246,13 @@ class AirLLMBaseModel(GenerationMixin):
             # for glm keep rotary_pos_emb in gpu
             self.load_rotary_pos_emb_to_device()
 
+        # Reinitialize rotary_emb with real weights for transformers 5.x+
+        # (model created with init_empty_weights has meta tensors;
+        #  rotary_emb moved from layer-level to model-level)
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'rotary_emb'):
+            rotary_cls = type(self.model.model.rotary_emb)
+            self.model.model.rotary_emb = rotary_cls(self.config, device=self.running_device)
+
     def set_layers_from_layer_names(self):
 
         self.layers = []
@@ -318,15 +327,20 @@ class AirLLMBaseModel(GenerationMixin):
                         layers.append(layer_name)
 
         for param_name in layers:
-            if (self.hf_quantizer is None or
-                not self.hf_quantizer.check_quantized_param(self.model, param_value=None, param_name=param_name, state_dict={})
-               ):
-                set_module_tensor_to_device(self.model, param_name, self.running_device, value=state_dict[param_name],
-                                            dtype=self.running_dtype,
-                                            )
-            else:
-                torch_dtype = self.hf_quantizer.update_torch_dtype(None)
-                self.hf_quantizer.create_quantized_param(self.model, state_dict[param_name], param_name, self.running_device, state_dict)
+            try:
+                if (self.hf_quantizer is None or
+                    not self.hf_quantizer.check_quantized_param(self.model, param_value=None, param_name=param_name, state_dict={})
+                   ):
+                    set_module_tensor_to_device(self.model, param_name, self.running_device, value=state_dict[param_name],
+                                                dtype=self.running_dtype,
+                                                )
+                else:
+                    torch_dtype = self.hf_quantizer.update_torch_dtype(None)
+                    self.hf_quantizer.create_quantized_param(self.model, state_dict[param_name], param_name, self.running_device, state_dict)
+            except (AttributeError, ValueError) as e:
+                # Skip parameters that don't exist in the current model structure
+                # e.g., rotary_emb moved from layer-level to model-level in newer transformers
+                pass
         return layers
 
     # make GenerationMixin happy
@@ -376,6 +390,8 @@ class AirLLMBaseModel(GenerationMixin):
         return self.forward(*args, **kwargs)
 
     def get_past_key_values_cache_seq_len(self, past_key_values):
+        if hasattr(past_key_values, 'get_seq_length'):
+            return past_key_values.get_seq_length()
         return past_key_values[0][0].shape[2]
     def get_sequence_len(self, seq):
         return seq.shape[1]
@@ -397,6 +413,13 @@ class AirLLMBaseModel(GenerationMixin):
     def run_lm_head(self, layer, seq):
         return layer(seq).float()
 
+    @staticmethod
+    def _extract_layer_output(layer_output):
+        """Extract hidden states from layer output (handles both tuple and tensor returns)."""
+        if isinstance(layer_output, (tuple, list)):
+            return layer_output[0]
+        return layer_output
+
     def run_norm(self, layer, seq):
         return layer(seq)
 
@@ -417,6 +440,7 @@ class AirLLMBaseModel(GenerationMixin):
         if cache_utils_installed:
             # we don't support kv cache for new version yet
             use_cache = False
+            past_key_values = None
 
         if self.profiling_mode:
             self.profiler.clear_profiling_time()
@@ -444,6 +468,9 @@ class AirLLMBaseModel(GenerationMixin):
                 kv_cache_list.append(([], []))
         all_hidden_states = [] * len(self.layers) if output_hidden_states else None
         all_self_attns = [] * len(self.layers) if output_attentions else None
+
+        # For transformers 5.x+: position_embeddings computed after embed layer
+        position_embeddings = None
 
         with torch.inference_mode(), ThreadPoolExecutor() as executor:
 
@@ -508,6 +535,10 @@ class AirLLMBaseModel(GenerationMixin):
 
                     if layer_name == self.layer_names_dict['embed']:
                         batch[j] = layer(seq)
+                        # Compute position_embeddings for transformers 5.x+ (rotary_emb at model level)
+                        if position_embeddings is None and hasattr(self.model, 'model') and hasattr(self.model.model, 'rotary_emb'):
+                            seq_len = self.get_sequence_len(batch[j])
+                            position_embeddings = self.model.model.rotary_emb(batch[j], position_ids[:, :seq_len])
                     elif layer_name == self.layer_names_dict['norm']:
                         #batch[j] = layer(seq[torch.arange(n_seq), batch_eos[j]][:, None])
                         batch[j] = self.run_norm(layer, seq)
@@ -542,7 +573,7 @@ class AirLLMBaseModel(GenerationMixin):
                             layer_outputs = layer(seq,
                                                   **kwargs
                                                   )
-                            new_seq = layer_outputs[0]
+                            new_seq = self._extract_layer_output(layer_outputs)
 
                             if output_attentions:
                                 all_self_attns[i].append(layer_outputs[1])
@@ -571,15 +602,19 @@ class AirLLMBaseModel(GenerationMixin):
                                           'attention_mask': attention_mask[:, :, -len_seq:, -len_seq:],
                                           }
                                 kwargs = {**kwargs, **pos_embed_args, **attention_mask_args, **position_ids_args}
+                                if position_embeddings is not None:
+                                    kwargs['position_embeddings'] = position_embeddings
 
 
-                                new_seq = layer(seq, **kwargs)[0]
+                                new_seq = self._extract_layer_output(layer(seq, **kwargs))
                             else:
 
                                 kwargs = {'use_cache': True,
                                           'attention_mask': attention_mask[:, :, -len_seq:, -len_seq:],
                                           }
                                 kwargs = {**kwargs, **pos_embed_args, **attention_mask_args, **position_ids_args}
+                                if position_embeddings is not None:
+                                    kwargs['position_embeddings'] = position_embeddings
 
                                 layer_out = layer(seq, **kwargs)
 
