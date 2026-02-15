@@ -15,7 +15,14 @@ from transformers.quantizers import AutoHfQuantizer, HfQuantizer
 
 from .profiler import LayeredProfiler
 
-from optimum.bettertransformer import BetterTransformer
+try:
+    from optimum.bettertransformer import BetterTransformer
+    optimum_installed = True
+    print('>>>> optimum installed')
+except ImportError:
+    BetterTransformer = None
+    optimum_installed = False
+    print('>>>> optimum not installed, will try to use sdpa or default instead')
 
 from .utils import clean_memory, load_layer, \
     find_or_create_local_splitted_path
