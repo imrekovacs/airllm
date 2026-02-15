@@ -191,7 +191,7 @@ class AirLLMBaseModel(GenerationMixin):
         # Load meta model (no memory used)
         self.model = None
 
-        if self.get_use_better_transformer():
+        if self.get_use_better_transformer() and BetterTransformer is not None:
             try:
                 with init_empty_weights():
                     self.model = AutoModelForCausalLM.from_config(self.config, trust_remote_code=True)

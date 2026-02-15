@@ -1,6 +1,7 @@
 .idea
 .ipynb_checkpoints
 .DS_Store
+.env
 airllm.egg-info
 build
 dist
